@@ -23,6 +23,10 @@ path = "src/bin/handshake_bench.rs"
 name = "ingress_bench"
 path = "src/bin/ingress_bench.rs"
 
+[[bin]]
+name = "contention_bench"
+path = "src/bin/contention_bench.rs"
+
 [dependencies]
 quinn = { path = "quinn/quinn", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }

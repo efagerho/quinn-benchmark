@@ -4,57 +4,136 @@
 # For every BRANCH it:
 #   1. checks out the branch in the `quinn/` submodule
 #   2. rebuilds the benchmark binaries (in release mode)
-#   3. runs handshake_bench and ingress_bench REPEATS times, tee-ing every run
-#      to a separate file under $OUT/
+#   3. runs handshake_bench, ingress_bench, and contention_bench REPEATS
+#      times, tee-ing every run to a separate file under $OUT/
 #
 # After every branch has been benchmarked, it reads all CSV lines back out of
 # the per-run files and prints a comparison table (median across runs) for
-# both benchmarks.
+# every benchmark.
 set -euo pipefail
 
 BRANCHES=(
-  main
-  endpoint-two-phase-accept
+#  main
+#  endpoint-two-phase-accept
   endpoint-ingress-offlock
-  endpoint-parking-lot
+  endpoint-ingress-offlock-accepting
+#  endpoint-parking-lot
+  endpoint-lock-optimization-accept-split
 )
 OUT=bench-results
 REPEATS=5
 
 mkdir -p "$OUT"
 
-# Common knobs — tuned for an AMD EPYC 9275F (24 physical cores, 48 SMT
-# threads, single socket).
+# Common knobs — auto-sized for the host.
 #
 # The benchmarks run server + client Tokio runtimes in the same process, so
-# the combined worker count should stay at (or slightly below) the physical
+# the combined worker count should stay at (or slightly below) the *physical*
 # core count to avoid SMT-induced cross-worker contention and to leave a
 # couple of cores free for kernel softirq / UDP RX handling, which dominates
 # when the handshake bench fires 2048 concurrent Initials at the server.
 #
 # Split: server gets the majority (that's the side we're stressing under
-# EndpointInner-lock contention), client gets enough to saturate it. 14 + 8
-# = 22, leaves 2 physical cores for softirq + driver task.
-SERVER_THREADS=14
-CLIENT_THREADS=8
+# EndpointInner-lock contention), client gets enough to saturate it. The
+# ratio matches the original hand-tuned config (14 server + 8 client out of
+# 24 physical cores on an AMD EPYC 9275F, leaving 2 cores for softirq +
+# driver task). Override by exporting CORES, SERVER_THREADS, or
+# CLIENT_THREADS before invoking this script.
+_detect_cores() {
+  if [ -n "${CORES:-}" ]; then
+    echo "$CORES"; return
+  fi
+  case "$(uname -s)" in
+    Darwin)
+      sysctl -n hw.physicalcpu 2>/dev/null && return ;;
+    Linux)
+      if command -v lscpu >/dev/null 2>&1; then
+        # Count distinct (Core, Socket) pairs = physical cores.
+        local n
+        n=$(lscpu -b -p=Core,Socket 2>/dev/null \
+              | awk -F, '!/^#/ { print $1"-"$2 }' | sort -u | wc -l)
+        if [ "${n:-0}" -gt 0 ]; then echo "$n"; return; fi
+      fi
+      if [ -r /proc/cpuinfo ]; then
+        # Fall back to logical CPU count.
+        local n
+        n=$(awk '/^processor/ { c++ } END { print c+0 }' /proc/cpuinfo)
+        if [ "${n:-0}" -gt 0 ]; then echo "$n"; return; fi
+      fi ;;
+  esac
+  if command -v nproc >/dev/null 2>&1; then nproc; return; fi
+  if command -v getconf >/dev/null 2>&1; then getconf _NPROCESSORS_ONLN; return; fi
+  echo 2
+}
+
+CORES=$(_detect_cores)
+
+# Reserve 2 cores on an 8+-core box (1 on smaller boxes) for softirq / UDP RX
+# / the endpoint driver task itself.
+if [ "$CORES" -ge 8 ]; then
+  RESERVED=2
+else
+  RESERVED=1
+fi
+USABLE=$(( CORES - RESERVED ))
+[ "$USABLE" -lt 2 ] && USABLE=2
+
+# Server/client split: ~7/4 (matches 14/8 at USABLE=22). The +10 in the
+# numerator rounds to nearest instead of truncating.
+SERVER_THREADS=${SERVER_THREADS:-$(( (USABLE * 7 + 10) / 11 ))}
+CLIENT_THREADS=${CLIENT_THREADS:-$(( USABLE - SERVER_THREADS ))}
+[ "$SERVER_THREADS" -lt 1 ] && SERVER_THREADS=1
+[ "$CLIENT_THREADS" -lt 1 ] && CLIENT_THREADS=1
+
+# Contention bench runs three runtimes in the same process: server,
+# throughput-client, churn-client. Split the CLIENT_THREADS budget evenly
+# between the two client runtimes so the throughput send-loop does not starve
+# the churn connect workers (which would artificially suppress the churn rate
+# and mask server-side lock contention). Override via CONT_CLIENT_THREADS /
+# CONT_CHURN_THREADS if needed.
+CONT_CLIENT_THREADS=${CONT_CLIENT_THREADS:-$(( (CLIENT_THREADS + 1) / 2 ))}
+CONT_CHURN_THREADS=${CONT_CHURN_THREADS:-$(( CLIENT_THREADS / 2 ))}
+[ "$CONT_CLIENT_THREADS" -lt 1 ] && CONT_CLIENT_THREADS=1
+[ "$CONT_CHURN_THREADS" -lt 1 ] && CONT_CHURN_THREADS=1
+
+echo "Detected $CORES physical cores -> server=$SERVER_THREADS client=$CLIENT_THREADS (reserved=$RESERVED)"
+echo "Contention split -> throughput=$CONT_CLIENT_THREADS churn=$CONT_CHURN_THREADS"
 
 ING_ARGS="--connections 1024 --workers-per-conn 4 --duration-secs 20 \
           --warmup-secs 3 --request-bytes 64 \
           --server-threads $SERVER_THREADS --client-threads $CLIENT_THREADS --csv"
 HS_ARGS="--total 200000 --concurrency 2048 --warmup 5000 \
          --server-threads $SERVER_THREADS --client-threads $CLIENT_THREADS --csv"
+# Contention bench: throughput measured first in isolation, then again while a
+# dedicated churn-client runtime hammers the endpoint with short-lived
+# connections as fast as the server will accept them. `degradation%` in the
+# final table is (1 - mixed/baseline).
+#
+# Stream size is deliberately small (128M) and fanned out across
+# connections/streams so the throughput phase is not client-AEAD-bound —
+# otherwise the server has endless CPU headroom and server-side lock
+# contention cannot show up as a mixed-phase slowdown. Rate limiting on the
+# churn driver is disabled; `--churn-workers` is the concurrent-in-flight
+# handshake ceiling.
+CONT_ARGS="--connections 8 --streams-per-connection 4 --stream-size 128M \
+           --duration-secs 15 --warmup-secs 3 \
+           --churn-workers 64 \
+           --server-threads $SERVER_THREADS \
+           --client-threads $CONT_CLIENT_THREADS \
+           --churn-threads $CONT_CHURN_THREADS --csv"
 
 for b in "${BRANCHES[@]}"; do
   echo "=== Building $b ==="
   ( cd quinn && git checkout "$b" )
-  cargo build --release --bin ingress_bench --bin handshake_bench
-  for bench in ingress handshake; do
+  cargo build --release --bin ingress_bench --bin handshake_bench --bin contention_bench
+  for bench in ingress handshake contention; do
     for i in $(seq 1 "$REPEATS"); do
       out="$OUT/${bench}_bench-$b-run$i.txt"
       echo "--- $bench $b run $i ---"
       case "$bench" in
-        ingress)   cmd="target/release/ingress_bench   $ING_ARGS --label $b" ;;
-        handshake) cmd="target/release/handshake_bench $HS_ARGS --label $b" ;;
+        ingress)    cmd="target/release/ingress_bench    $ING_ARGS  --label $b" ;;
+        handshake)  cmd="target/release/handshake_bench  $HS_ARGS   --label $b" ;;
+        contention) cmd="target/release/contention_bench $CONT_ARGS --label $b" ;;
       esac
       $cmd | tee "$out"
     done
@@ -142,6 +221,26 @@ _ingress_field() {
   _csv_lines "$branch" ingress | awk -F, -v c="$col" '{print $c}' | _median
 }
 
+# Print a contention comparison row. Columns (from contention_bench CSV):
+#   1 CSV
+#   2 label
+#   3 connections
+#   4 streams_per_connection
+#   5 stream_bytes
+#   6 churn_rate
+#   7 churn_workers
+#   8 server_threads
+#   9 client_threads
+#  10 mixed_wall_ms
+#  11 baseline_mib_s
+#  12 mixed_mib_s
+#  13 achieved_churn (conn/s)
+#  14 degradation_pct
+_contention_field() {
+  local branch="$1" col="$2"
+  _csv_lines "$branch" contention | awk -F, -v c="$col" '{print $c}' | _median
+}
+
 # Format microseconds as milliseconds with two decimals.
 _us_to_ms() {
   awk 'BEGIN { x = ARGV[1] + 0; printf("%.2f", x / 1000.0) }' "$1"
@@ -205,6 +304,30 @@ for b in "${BRANCHES[@]}"; do
       "$(_us_to_ms "$p99")" \
       "$(_us_to_ms "$p999")" \
       "$(_us_to_ms "$max")"
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# Contention table
+# ---------------------------------------------------------------------------
+printf '\nContention bench  (MiB/s, churn conn/s, degradation %%)\n'
+printf '%-28s %12s %12s %12s %9s\n' \
+  branch baseline mixed churn degr%
+printf -- '------------------------------------------------------------------------------------------\n'
+for b in "${BRANCHES[@]}"; do
+  baseline=$(_contention_field "$b" 11)
+  mixed=$(_contention_field "$b" 12)
+  churn=$(_contention_field "$b" 13)
+  degr=$(_contention_field "$b" 14)
+  if [ "$baseline" = "-" ]; then
+    printf '%-28s %12s %12s %12s %9s\n' "$b" - - - -
+  else
+    printf '%-28s %12s %12s %12s %9s\n' \
+      "$b" \
+      "$(_fmt_throughput "$baseline")" \
+      "$(_fmt_throughput "$mixed")" \
+      "$(_fmt_throughput "$churn")" \
+      "$(_fmt_throughput "$degr")"
   fi
 done
 echo
