@@ -3,6 +3,8 @@
 //! Keeps TLS/crypto setup and self-signed certificate generation in one place
 //! so each benchmark binary only has to focus on its specific workload.
 
+pub mod contention;
+
 use std::sync::{Arc, Once};
 
 use anyhow::{Context, Result};
