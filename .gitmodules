@@ -1,0 +1,3 @@
+[submodule "quinn"]
+	path = quinn
+	url = git@github.com:efagerho/quinn.git

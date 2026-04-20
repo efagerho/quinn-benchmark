@@ -1,0 +1,42 @@
+[package]
+name = "quinn-benchmarks"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "quinn_benchmark"
+path = "src/lib.rs"
+
+[[bin]]
+name = "echo_server"
+path = "src/bin/echo_server.rs"
+
+[[bin]]
+name = "load_client"
+path = "src/bin/load_client.rs"
+
+[[bin]]
+name = "handshake_bench"
+path = "src/bin/handshake_bench.rs"
+
+[[bin]]
+name = "ingress_bench"
+path = "src/bin/ingress_bench.rs"
+
+[dependencies]
+quinn = { path = "quinn/quinn", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+rcgen = "0.14"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[profile.release]
+debug = true
+
+# Keep this crate as its own (single-crate) package. The `quinn/` submodule
+# has its own Cargo workspace, and a [workspace] section here would try to
+# absorb it.
