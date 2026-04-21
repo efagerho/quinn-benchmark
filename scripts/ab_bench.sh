@@ -15,10 +15,11 @@ set -euo pipefail
 BRANCHES=(
 #  main
 #  endpoint-two-phase-accept
-  endpoint-ingress-offlock
-  endpoint-ingress-offlock-accepting
+#  endpoint-ingress-offlock
+#  endpoint-ingress-offlock-accepting
 #  endpoint-parking-lot
   endpoint-lock-optimization-accept-split
+  endpoint-lock-optimization-accept-split-batching
 )
 OUT=bench-results
 REPEATS=5
@@ -102,6 +103,18 @@ echo "Contention split -> throughput=$CONT_CLIENT_THREADS churn=$CONT_CHURN_THRE
 ING_ARGS="--connections 1024 --workers-per-conn 4 --duration-secs 20 \
           --warmup-secs 3 --request-bytes 64 \
           --server-threads $SERVER_THREADS --client-threads $CLIENT_THREADS --csv"
+# Batching-friendly ingress: same total in-flight workers (4 * 256 = 1024) as
+# the standard ingress test, but funnelled through only 4 long-lived
+# connections. With BATCH_SIZE=32 in the recv path the expected run length
+# of consecutive same-handle datagrams is ~BATCH_SIZE/N, so 4 flows yields
+# runs of ~8 on non-GRO platforms and tens-to-hundreds on Linux with GRO --
+# i.e. exactly the regime where the recv-path Datagrams coalescer can pay
+# off. Keeping in-flight work constant isolates the variable to "how many
+# flows" so any throughput delta vs. ING_ARGS is attributable to per-recv
+# run length, not client-side CPU saturation.
+ING_BATCH_ARGS="--connections 4 --workers-per-conn 256 --duration-secs 20 \
+                --warmup-secs 3 --request-bytes 64 \
+                --server-threads $SERVER_THREADS --client-threads $CLIENT_THREADS --csv"
 HS_ARGS="--total 200000 --concurrency 2048 --warmup 5000 \
          --server-threads $SERVER_THREADS --client-threads $CLIENT_THREADS --csv"
 # Contention bench: throughput measured first in isolation, then again while a
@@ -126,14 +139,15 @@ for b in "${BRANCHES[@]}"; do
   echo "=== Building $b ==="
   ( cd quinn && git checkout "$b" )
   cargo build --release --bin ingress_bench --bin handshake_bench --bin contention_bench
-  for bench in ingress handshake contention; do
+  for bench in ingress ingress_batch handshake contention; do
     for i in $(seq 1 "$REPEATS"); do
       out="$OUT/${bench}_bench-$b-run$i.txt"
       echo "--- $bench $b run $i ---"
       case "$bench" in
-        ingress)    cmd="target/release/ingress_bench    $ING_ARGS  --label $b" ;;
-        handshake)  cmd="target/release/handshake_bench  $HS_ARGS   --label $b" ;;
-        contention) cmd="target/release/contention_bench $CONT_ARGS --label $b" ;;
+        ingress)       cmd="target/release/ingress_bench    $ING_ARGS       --label $b" ;;
+        ingress_batch) cmd="target/release/ingress_bench    $ING_BATCH_ARGS --label $b" ;;
+        handshake)     cmd="target/release/handshake_bench  $HS_ARGS        --label $b" ;;
+        contention)    cmd="target/release/contention_bench $CONT_ARGS      --label $b" ;;
       esac
       $cmd | tee "$out"
     done
@@ -217,8 +231,8 @@ _handshake_field() {
 #  19 p999_us
 #  20 max_us
 _ingress_field() {
-  local branch="$1" col="$2"
-  _csv_lines "$branch" ingress | awk -F, -v c="$col" '{print $c}' | _median
+  local branch="$1" col="$2" bench="${3:-ingress}"
+  _csv_lines "$branch" "$bench" | awk -F, -v c="$col" '{print $c}' | _median
 }
 
 # Print a contention comparison row. Columns (from contention_bench CSV):
@@ -293,6 +307,38 @@ for b in "${BRANCHES[@]}"; do
   p99=$(_ingress_field "$b" 18)
   p999=$(_ingress_field "$b" 19)
   max=$(_ingress_field "$b" 20)
+  if [ "$t" = "-" ]; then
+    printf '%-28s %12s %9s %9s %9s %9s %9s\n' "$b" - - - - - -
+  else
+    printf '%-28s %12s %9s %9s %9s %9s %9s\n' \
+      "$b" \
+      "$(_fmt_throughput "$t")" \
+      "$(_us_to_ms "$mean")" \
+      "$(_us_to_ms "$p50")" \
+      "$(_us_to_ms "$p99")" \
+      "$(_us_to_ms "$p999")" \
+      "$(_us_to_ms "$max")"
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# Ingress (batching) table
+# ---------------------------------------------------------------------------
+# Same binary as the Ingress table above, run with ING_BATCH_ARGS to produce
+# long runs of same-connection datagrams in the recv path. This is the
+# workload where the Datagrams coalescer should win; if the batching branch
+# is not ahead here, the optimization is not earning its keep.
+printf '\nIngress bench (batching, 4 conns x 256 workers)  (req/s, latency in ms)\n'
+printf '%-28s %12s %9s %9s %9s %9s %9s\n' \
+  branch throughput mean p50 p99 p99.9 max
+printf -- '------------------------------------------------------------------------------------------\n'
+for b in "${BRANCHES[@]}"; do
+  t=$(_ingress_field "$b" 12 ingress_batch)
+  mean=$(_ingress_field "$b" 14 ingress_batch)
+  p50=$(_ingress_field "$b" 15 ingress_batch)
+  p99=$(_ingress_field "$b" 18 ingress_batch)
+  p999=$(_ingress_field "$b" 19 ingress_batch)
+  max=$(_ingress_field "$b" 20 ingress_batch)
   if [ "$t" = "-" ]; then
     printf '%-28s %12s %9s %9s %9s %9s %9s\n' "$b" - - - - - -
   else
