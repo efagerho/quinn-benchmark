@@ -13,7 +13,8 @@
 #
 # Prerequisites (checked + auto-installed where possible):
 #   - `cargo`                          installed via rustup, assumed present.
-#   - `flamegraph` (cargo-flamegraph)  auto-installed via `cargo install flamegraph --locked`.
+#   - `inferno-collapse-perf` +
+#     `inferno-flamegraph`             auto-installed via `cargo install inferno --locked`.
 #   - `perf`                           must be present on PATH. On Debian/Ubuntu:
 #                                        sudo apt install linux-tools-$(uname -r)
 #                                      On Fedora/RHEL:
@@ -59,9 +60,10 @@ EOF
   exit 1
 fi
 
-if ! command -v flamegraph >/dev/null 2>&1; then
-  echo "flamegraph not found, installing cargo-flamegraph..."
-  cargo install flamegraph --locked
+if ! command -v inferno-flamegraph >/dev/null 2>&1 \
+  || ! command -v inferno-collapse-perf >/dev/null 2>&1; then
+  echo "inferno tooling not found, installing inferno..."
+  cargo install inferno --locked
 fi
 
 # -----------------------------------------------------------------------------
@@ -122,26 +124,33 @@ mkdir -p "$OUTDIR"
 cp target/release/ingress_bench "$OUTDIR/ingress_bench"
 
 # -----------------------------------------------------------------------------
-# Flamegraph run
+# Flamegraph run (perf record + inferno post-processing)
 # -----------------------------------------------------------------------------
-# --freq 999:      avoids lockstep sampling with any 1 kHz periodic activity.
-# --call-graph dwarf: Rust async stacks go through frames that fp-based unwinding
-#                     drops. DWARF is more expensive but produces readable traces.
-# --no-inline:     leave off; inlining is fine for a release binary and the
-#                  flamegraph resolver handles it.
-#
-# cargo-flamegraph leaves perf.data in the cwd. We move it into $OUTDIR after.
-echo "=== Flamegraph run for $BRANCH ==="
-rm -f perf.data perf.data.old
-flamegraph \
-  --freq 999 \
-  --call-graph dwarf \
-  -o "$OUTDIR/flamegraph.svg" \
+# -F 999:           avoids lockstep sampling with any 1 kHz periodic activity.
+# --call-graph dwarf,16384:
+#                   Rust stacks go through frames that fp-based unwinding drops
+#                   (no frame pointers by default in release). DWARF unwinding
+#                   needs a stack-slice size; 16 KiB covers deep async stacks
+#                   without blowing up perf.data. Default (8 KiB) sometimes
+#                   truncates quinn's stacks.
+# -g:               enable call-graph recording (implied by --call-graph).
+# -o <path>:        write perf.data directly to the output dir.
+echo "=== perf record (DWARF call-graph) for $BRANCH ==="
+perf record \
+  -F 999 \
+  --call-graph dwarf,16384 \
+  -g \
+  -o "$OUTDIR/perf.data" \
   -- target/release/ingress_bench "${ING_ARGS[@]}"
-if [ -f perf.data ]; then
-  mv perf.data "$OUTDIR/perf.data"
-fi
-rm -f perf.data.old
+
+echo "=== Rendering flamegraph via inferno ==="
+perf script -i "$OUTDIR/perf.data" \
+  | inferno-collapse-perf > "$OUTDIR/perf.folded"
+inferno-flamegraph \
+  --title "ingress_bench $BRANCH" \
+  --subtitle "1024 conns x 4 workers, 20s, DWARF call-graph" \
+  < "$OUTDIR/perf.folded" \
+  > "$OUTDIR/flamegraph.svg"
 
 # -----------------------------------------------------------------------------
 # perf stat run (separate run so flamegraph's sampling doesn't perturb counters)
