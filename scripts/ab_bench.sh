@@ -20,6 +20,7 @@ BRANCHES=(
 #  endpoint-parking-lot
   endpoint-lock-optimization-accept-split
   endpoint-lock-optimization-accept-split-batching
+  endpoint-shrink-datagram-event
 )
 OUT=bench-results
 REPEATS=5
