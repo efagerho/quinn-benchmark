@@ -24,6 +24,10 @@ name = "ingress_bench"
 path = "src/bin/ingress_bench.rs"
 
 [[bin]]
+name = "stream_open_bench"
+path = "src/bin/stream_open_bench.rs"
+
+[[bin]]
 name = "contention_bench"
 path = "src/bin/contention_bench.rs"
 
@@ -37,6 +41,7 @@ clap = { version = "4", features = ["derive"] }
 bytes = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+socket2 = "0.6.3"
 
 [profile.release]
 debug = true

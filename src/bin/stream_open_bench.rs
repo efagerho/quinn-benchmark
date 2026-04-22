@@ -1,43 +1,26 @@
-//! QUIC server-side ingress throughput benchmark.
+//! QUIC server-side ingress benchmark variant: stream-open dominated.
 //!
-//! Stresses the datagram-ingress code path that the `endpoint-ingress-offlock` refactor
-//! changed: `EndpointShared::partial_handle` (payload/header decode + initial-key derivation)
-//! now runs *off* the endpoint state mutex, and the `EndpointDriver::poll` loop acquires the
-//! state mutex only for the commit phase and event dispatch.
+//! Each client iteration opens a *fresh unidirectional* stream, writes a
+//! fixed 16-byte payload, and finishes the stream. No response, no echo: the
+//! server accepts the stream, reads to EOF, and drops it. This isolates the
+//! "new-stream + tiny-payload + FIN" hot path on the ingress side, where the
+//! per-datagram overhead of NEW_STREAM accounting, frame dispatch, and
+//! MAX_STREAMS flow-control updates dominates rather than bulk read/write
+//! throughput.
 //!
-//! The workload:
-//!   1. Establishes N long-lived connections from clients to a single server endpoint.
-//!   2. Every client worker opens one bidirectional stream per iteration, writes a small
-//!      payload, reads the echo, closes the stream, and repeats. Each iteration produces
-//!      multiple datagrams in each direction, all of which traverse the server's ingress
-//!      path.
-//!   3. Runs for a fixed wall-clock duration under sustained concurrency.
-//!
-//! We intentionally keep payloads small so the datagram count (and therefore the ingress
-//! hot path: `partial_handle` + `commit_handle`) dominates, rather than bulk
-//! send/recv throughput.
-//!
-//! Reports aggregate throughput (datagrams/second approx by request-response rate and
-//! bytes/second) plus per-request latency percentiles.
+//! Compared to `ingress_bench`, which also opens a fresh stream per iteration
+//! but runs a bidirectional echo (adding a full server->client response and
+//! a per-iteration client-side read), this benchmark removes the response
+//! path entirely so the measurement is a one-way stream-open rate stressed
+//! by stream-flow-control (MAX_STREAMS) credit issuance rather than
+//! request/response round-trip latency.
 //!
 //! Usage:
 //!
 //! ```text
-//! cargo run --release --bin ingress_bench -- \
+//! cargo run --release --bin stream_open_bench -- \
 //!     --connections 64 --workers-per-conn 4 --duration-secs 10 \
 //!     --server-threads 8 --client-threads 4
-//! ```
-//!
-//! A/B procedure (three target branches: main, endpoint-two-phase-accept,
-//! endpoint-ingress-offlock):
-//!
-//! ```text
-//! (cd quinn && git checkout main)                         && cargo build --release --bin ingress_bench
-//! target/release/ingress_bench --csv --label main ...
-//! (cd quinn && git checkout endpoint-two-phase-accept)    && cargo build --release --bin ingress_bench
-//! target/release/ingress_bench --csv --label two-phase ...
-//! (cd quinn && git checkout endpoint-ingress-offlock)     && cargo build --release --bin ingress_bench
-//! target/release/ingress_bench --csv --label ingress-off ...
 //! ```
 
 use std::{
@@ -62,18 +45,29 @@ use tokio::{
     task::JoinSet,
 };
 
+/// Fixed payload written by every client iteration.
+///
+/// Contents are arbitrary: the sole purpose is to carry 16 bytes of STREAM
+/// frame payload so the server-side decode/assembler path is exercised.
+const PAYLOAD: [u8; 16] = [
+    0x51, 0x55, 0x49, 0x4e, // "QUIN"
+    0x4e, 0x2d, 0x4f, 0x50, // "N-OP"
+    0x45, 0x4e, 0x2d, 0x42, // "EN-B"
+    0x45, 0x4e, 0x43, 0x48, // "ENCH"
+];
+
 #[derive(Parser, Debug, Clone)]
 #[clap(
-    name = "ingress_bench",
-    about = "Measure QUIC server-side ingress throughput under sustained concurrency."
+    name = "stream_open_bench",
+    about = "Measure QUIC server-side ingress throughput for open-uni + 16B + finish."
 )]
 struct Opt {
     /// Number of long-lived client connections to the server.
     #[clap(long, default_value_t = 64)]
     connections: usize,
 
-    /// Concurrent request-response loops per connection (each opens its own bi stream
-    /// per iteration).
+    /// Concurrent stream-open loops per connection (each opens its own uni
+    /// stream per iteration).
     #[clap(long, default_value_t = 4)]
     workers_per_conn: usize,
 
@@ -85,11 +79,6 @@ struct Opt {
     #[clap(long, default_value_t = 1.0)]
     warmup_secs: f64,
 
-    /// Bytes written (and echoed back) per request. Keep small to stress per-datagram
-    /// ingress rather than bulk throughput.
-    #[clap(long, default_value_t = 64)]
-    request_bytes: usize,
-
     /// Worker threads for the server tokio runtime. 0 = CPU count.
     #[clap(long, default_value_t = 0)]
     server_threads: usize,
@@ -99,21 +88,12 @@ struct Opt {
     client_threads: usize,
 
     /// Number of server-side UDP sockets bound with `SO_REUSEPORT` to the same port.
-    ///
-    /// Each socket drives its own `quinn::Endpoint`, letting the kernel fan incoming
-    /// datagrams out across sockets by 4-tuple hash. Eliminates the single-socket
-    /// `udp_sendmsg` spinlock + the single-endpoint driver-lock bottleneck observed
-    /// in profiles of the `endpoint-lock-optimization-accept-split` branch. Default
-    /// `1` preserves the previous single-endpoint behaviour.
     #[clap(long, default_value_t = 1)]
     server_shards: usize,
 
     /// Number of distinct client-side endpoints (each with its own source port)
-    /// used to open the long-lived connections.
-    ///
-    /// A single client endpoint funnels every connection through one (src, dst)
-    /// 4-tuple and therefore one `SO_REUSEPORT` bucket, defeating server sharding.
-    /// Default `0` means "match `--server-shards`".
+    /// used to open the long-lived connections. `0` means "match
+    /// `--server-shards`".
     #[clap(long, default_value_t = 0)]
     client_endpoints: usize,
 
@@ -154,6 +134,7 @@ fn main() -> Result<()> {
     let client_rt = build_rt("bench-client", opt.client_threads)?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
+    let server_recv_count = Arc::new(AtomicU64::new(0));
     let (server_addr, server_endpoints) = {
         let _guard = server_rt.enter();
         build_server_endpoints(
@@ -164,7 +145,11 @@ fn main() -> Result<()> {
     };
     let mut server_tasks = Vec::with_capacity(server_endpoints.len());
     for ep in &server_endpoints {
-        server_tasks.push(server_rt.spawn(run_server(ep.clone(), shutdown.clone())));
+        server_tasks.push(server_rt.spawn(run_server(
+            ep.clone(),
+            shutdown.clone(),
+            server_recv_count.clone(),
+        )));
     }
 
     let client_endpoints = if opt.client_endpoints == 0 {
@@ -179,6 +164,7 @@ fn main() -> Result<()> {
             client_config,
             client_endpoints,
             opt.clone(),
+            server_recv_count.clone(),
         ))
         .context("workload failed")?;
 
@@ -200,15 +186,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Build `shards` server-side `quinn::Endpoint`s that all share a single UDP port
-/// via `SO_REUSEPORT`.
-///
-/// The first socket binds port 0 (kernel picks a free port) and sets
-/// `SO_REUSEPORT` before bind so that subsequent sockets can attach to the same
-/// port. Linux hashes incoming datagrams across the REUSEPORT group by 4-tuple,
-/// so different clients (distinct source ports) get fanned out across shards.
-///
-/// Returns the common bound address together with the constructed endpoints.
+/// Same sharded-server builder as `ingress_bench`.
 fn build_server_endpoints(
     addr: SocketAddr,
     shards: usize,
@@ -220,13 +198,9 @@ fn build_server_endpoints(
     let mut endpoints = Vec::with_capacity(shards);
     let mut bound_addr: Option<SocketAddr> = None;
     for i in 0..shards {
-        let bind_addr = match bound_addr {
-            Some(existing) => existing,
-            None => addr,
-        };
-        let socket = build_reuseport_socket(bind_addr, shards > 1).with_context(|| {
-            format!("build server socket shard {i} bound at {bind_addr}")
-        })?;
+        let bind_addr = bound_addr.unwrap_or(addr);
+        let socket = build_reuseport_socket(bind_addr, shards > 1)
+            .with_context(|| format!("build server socket shard {i} bound at {bind_addr}"))?;
         let local = socket
             .local_addr()
             .context("read local_addr of server socket")?;
@@ -246,19 +220,12 @@ fn build_server_endpoints(
     Ok((bound_addr, endpoints))
 }
 
-/// Build a UDP socket at `addr`, optionally enabling `SO_REUSEPORT` so that many
-/// sockets can share the same port. Mirrors the dual-stack behaviour of
-/// `quinn::Endpoint::server` for IPv6 addresses.
 fn build_reuseport_socket(addr: SocketAddr, reuse_port: bool) -> Result<std::net::UdpSocket> {
     let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))
         .context("create UDP socket")?;
     if addr.is_ipv6() {
-        // Match `Endpoint::server` best-effort dual-stack behaviour.
         let _ = socket.set_only_v6(false);
     }
-    // `SO_REUSEPORT` must be set on *every* socket in the group, including the
-    // first one, and must be set before `bind`. Without this, the second
-    // `bind()` on the same port returns EADDRINUSE.
     if reuse_port {
         #[cfg(unix)]
         {
@@ -270,17 +237,14 @@ fn build_reuseport_socket(addr: SocketAddr, reuse_port: bool) -> Result<std::net
     Ok(socket.into())
 }
 
-/// Standalone helper for `run_workload` to build a client endpoint with a
-/// distinct ephemeral source port. Unlike the server side, these do *not* need
-/// `SO_REUSEPORT`: each call asks the kernel for a fresh free port, which is
-/// exactly what we want so that different connection 4-tuples hash into
-/// different server shards.
 fn build_client_endpoint() -> Result<quinn::Endpoint> {
     let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))
         .context("create client UDP socket")?;
     let _ = socket.set_only_v6(false);
     let bind_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0);
-    socket.bind(&bind_addr.into()).context("bind client UDP socket")?;
+    socket
+        .bind(&bind_addr.into())
+        .context("bind client UDP socket")?;
     let socket: std::net::UdpSocket = socket.into();
     let endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
@@ -302,11 +266,13 @@ fn build_rt(name: &str, threads: usize) -> Result<Runtime> {
     Ok(b.build()?)
 }
 
-/// Accept each incoming connection and for every bidirectional stream echo the first
-/// `request_bytes` bytes back, then end the stream. The server performs the minimum amount
-/// of per-stream work so that the datagram ingress path on the endpoint's main UDP socket
-/// (which is exactly what this branch restructures) dominates the server-side wall time.
-async fn run_server(endpoint: quinn::Endpoint, shutdown: Arc<AtomicBool>) {
+/// Accept every incoming unidirectional stream and read it to EOF, dropping
+/// the data. Each completed stream bumps `recv_count`. No response is sent.
+async fn run_server(
+    endpoint: quinn::Endpoint,
+    shutdown: Arc<AtomicBool>,
+    recv_count: Arc<AtomicU64>,
+) {
     loop {
         let incoming = match endpoint.accept().await {
             Some(i) => i,
@@ -316,6 +282,7 @@ async fn run_server(endpoint: quinn::Endpoint, shutdown: Arc<AtomicBool>) {
             incoming.ignore();
             continue;
         }
+        let recv_count = recv_count.clone();
         tokio::spawn(async move {
             let connecting = match incoming.accept() {
                 Ok(c) => c,
@@ -325,23 +292,24 @@ async fn run_server(endpoint: quinn::Endpoint, shutdown: Arc<AtomicBool>) {
                 return;
             };
             loop {
-                let (mut send, mut recv) = match conn.accept_bi().await {
-                    Ok(pair) => pair,
+                let mut recv = match conn.accept_uni().await {
+                    Ok(s) => s,
                     Err(_) => return,
                 };
+                let recv_count = recv_count.clone();
                 tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
+                    // Payload is tiny (16 B expected) but we still loop so the
+                    // server side correctly drains any future path that
+                    // fragments it across multiple STREAM frames.
+                    let mut buf = [0u8; 64];
                     loop {
-                        let n = match recv.read(&mut buf).await {
-                            Ok(Some(n)) => n,
+                        match recv.read(&mut buf).await {
+                            Ok(Some(_)) => continue,
                             Ok(None) => break,
                             Err(_) => return,
-                        };
-                        if send.write_all(&buf[..n]).await.is_err() {
-                            return;
                         }
                     }
-                    let _ = send.finish();
+                    recv_count.fetch_add(1, Ordering::Relaxed);
                 });
             }
         });
@@ -350,10 +318,12 @@ async fn run_server(endpoint: quinn::Endpoint, shutdown: Arc<AtomicBool>) {
 
 struct WorkloadStats {
     wall: Duration,
-    requests: u64,
+    client_sends: u64,
+    server_recvs: u64,
     bytes: u64,
     errors: u64,
-    /// Sorted ascending per-request round-trip latency samples.
+    /// Sorted ascending per-iteration client-side latency samples (open_uni +
+    /// write_all + finish).
     latencies: Vec<Duration>,
 }
 
@@ -362,21 +332,14 @@ async fn run_workload(
     client_config: quinn::ClientConfig,
     client_endpoint_count: usize,
     opt: Opt,
+    server_recv_count: Arc<AtomicU64>,
 ) -> Result<WorkloadStats> {
-    // Allocate one or more client endpoints, each with its own source port. With a
-    // sharded server (`--server-shards > 1`) distinct source ports are what lets
-    // the kernel spread incoming connections across the server's `SO_REUSEPORT`
-    // group. With `--server-shards == 1` a single endpoint still suffices.
     let n_client_eps = client_endpoint_count.max(1);
     let mut client_endpoints = Vec::with_capacity(n_client_eps);
     for _ in 0..n_client_eps {
         client_endpoints.push(build_client_endpoint().context("create client endpoint")?);
     }
 
-    // Establish N long-lived connections up front, round-robining across the
-    // client endpoints so each endpoint hosts roughly `connections / n_client_eps`
-    // connections. Keeping connections on distinct source ports is the only way
-    // for `SO_REUSEPORT` on the server to actually split load.
     let mut connections = Vec::with_capacity(opt.connections);
     for i in 0..opt.connections {
         let ep = &client_endpoints[i % n_client_eps];
@@ -389,7 +352,7 @@ async fn run_workload(
     }
 
     let stop = Arc::new(AtomicBool::new(false));
-    let request_counter = Arc::new(AtomicU64::new(0));
+    let send_counter = Arc::new(AtomicU64::new(0));
     let byte_counter = Arc::new(AtomicU64::new(0));
     let error_counter = Arc::new(AtomicU64::new(0));
 
@@ -401,29 +364,23 @@ async fn run_workload(
         for _ in 0..opt.workers_per_conn {
             let conn = conn.clone();
             let stop = stop.clone();
-            let requests = request_counter.clone();
+            let sends = send_counter.clone();
             let bytes = byte_counter.clone();
             let errors = error_counter.clone();
             let barrier = start_barrier.clone();
-            let request_bytes = opt.request_bytes;
             join.spawn(async move {
-                // Warm up: do a handful of iterations before the barrier so the TLS/QUIC
-                // state settles and flow-control windows are opened.
-                let payload = vec![0xABu8; request_bytes];
-                let mut scratch = vec![0u8; request_bytes];
                 for _ in 0..4 {
-                    let _ =
-                        round_trip(&conn, &payload, &mut scratch, request_bytes).await;
+                    let _ = fire_and_forget(&conn).await;
                 }
                 barrier.wait().await;
 
                 let mut local_latencies = Vec::with_capacity(1024);
                 while !stop.load(Ordering::Relaxed) {
                     let t0 = Instant::now();
-                    match round_trip(&conn, &payload, &mut scratch, request_bytes).await {
+                    match fire_and_forget(&conn).await {
                         Ok(n) => {
                             local_latencies.push(t0.elapsed());
-                            requests.fetch_add(1, Ordering::Relaxed);
+                            sends.fetch_add(1, Ordering::Relaxed);
                             bytes.fetch_add(n as u64, Ordering::Relaxed);
                         }
                         Err(_) => {
@@ -437,25 +394,24 @@ async fn run_workload(
         }
     }
 
-    // Warmup is separate from the measured region: we rely on the per-worker warmup
-    // iterations above plus a bounded warmup sleep. The fixed wait guarantees all workers
-    // have crossed the barrier before measurement starts.
     start_barrier.wait().await;
     if opt.warmup_secs > 0.0 {
         tokio::time::sleep(Duration::from_secs_f64(opt.warmup_secs)).await;
     }
 
-    // Reset counters so warmup activity doesn't pollute the measurement.
-    request_counter.store(0, Ordering::Relaxed);
+    send_counter.store(0, Ordering::Relaxed);
     byte_counter.store(0, Ordering::Relaxed);
     error_counter.store(0, Ordering::Relaxed);
+    // Snapshot the server-side receive count at measurement start so we can
+    // report a true "server completed streams during the measured window"
+    // number that excludes warmup traffic.
+    let server_recvs_start = server_recv_count.load(Ordering::Relaxed);
 
     let wall_start = Instant::now();
     tokio::time::sleep(Duration::from_secs_f64(opt.duration_secs)).await;
     stop.store(true, Ordering::Relaxed);
     let wall = wall_start.elapsed();
 
-    // Drain workers and aggregate latencies.
     let mut all_latencies = Vec::new();
     while let Some(res) = join.join_next().await {
         if let Ok(mut v) = res {
@@ -463,46 +419,34 @@ async fn run_workload(
         }
     }
 
-    // Drop client connections so the server's wait_idle() returns.
+    // Final server-side snapshot. We take it *after* the client join-set has
+    // drained, so any still-in-flight streams finished by the client before
+    // it observed `stop` are counted. Briefly yield to let the server's
+    // accept_uni tasks drain.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let server_recvs_end = server_recv_count.load(Ordering::Relaxed);
+
     drop(connections);
     drop(client_endpoints);
 
     all_latencies.sort_unstable();
     Ok(WorkloadStats {
         wall,
-        requests: request_counter.load(Ordering::Relaxed),
+        client_sends: send_counter.load(Ordering::Relaxed),
+        server_recvs: server_recvs_end.saturating_sub(server_recvs_start),
         bytes: byte_counter.load(Ordering::Relaxed),
         errors: error_counter.load(Ordering::Relaxed),
         latencies: all_latencies,
     })
 }
 
-/// Open a fresh bidirectional stream, write `len` bytes, read the echo, finish.
-///
-/// We use a fresh stream per iteration so the driver sees new STREAM/stream-open frames
-/// each round, keeping the per-datagram ingress path exercised rather than steady-state
-/// flow control on a single stream.
-async fn round_trip(
-    conn: &quinn::Connection,
-    payload: &[u8],
-    scratch: &mut [u8],
-    len: usize,
-) -> Result<usize> {
-    let (mut send, mut recv) = conn.open_bi().await?;
-    send.write_all(&payload[..len]).await?;
+/// Open a fresh unidirectional stream, write the fixed 16-byte payload, and
+/// finish. No response is read -- the server drains the stream and drops it.
+async fn fire_and_forget(conn: &quinn::Connection) -> Result<usize> {
+    let mut send = conn.open_uni().await?;
+    send.write_all(&PAYLOAD).await?;
     send.finish()?;
-
-    // Read until the peer signals EOF (finish).
-    let mut total = 0usize;
-    while total < len {
-        match recv.read(&mut scratch[total..len]).await? {
-            Some(n) => total += n,
-            None => break,
-        }
-    }
-    // Drain any trailing bytes / EOF marker.
-    let _ = recv.read(&mut scratch[0..0]).await;
-    Ok(total)
+    Ok(PAYLOAD.len())
 }
 
 fn percentile(sorted: &[Duration], p: f64) -> Duration {
@@ -514,9 +458,14 @@ fn percentile(sorted: &[Duration], p: f64) -> Duration {
 }
 
 fn report(opt: &Opt, client_endpoint_count: usize, stats: &WorkloadStats) {
-    let measured = stats.requests;
+    let client_sends = stats.client_sends;
+    let server_recvs = stats.server_recvs;
     let errors = stats.errors;
-    let throughput = measured as f64 / stats.wall.as_secs_f64();
+    // Primary "throughput" = server-observed completed streams / wall. This is
+    // the ingress-side rate we care about. We also print the client-side send
+    // rate for sanity (they should match closely at steady state).
+    let server_throughput = server_recvs as f64 / stats.wall.as_secs_f64();
+    let client_throughput = client_sends as f64 / stats.wall.as_secs_f64();
     let bytes_per_sec = stats.bytes as f64 / stats.wall.as_secs_f64();
     let p50 = percentile(&stats.latencies, 0.50);
     let p90 = percentile(&stats.latencies, 0.90);
@@ -537,7 +486,7 @@ fn report(opt: &Opt, client_endpoint_count: usize, stats: &WorkloadStats) {
         )
     };
 
-    println!("\n=== QUIC server-side ingress benchmark ===");
+    println!("\n=== QUIC stream-open (uni, 16B, finish) bench ===");
     println!("configuration:");
     println!("  --connections         {}", opt.connections);
     println!("  --workers-per-conn    {}", opt.workers_per_conn);
@@ -545,7 +494,7 @@ fn report(opt: &Opt, client_endpoint_count: usize, stats: &WorkloadStats) {
         "  --duration-secs       {:.3} (warmup {:.3})",
         opt.duration_secs, opt.warmup_secs
     );
-    println!("  --request-bytes       {}", opt.request_bytes);
+    println!("  payload               {} bytes (fixed)", PAYLOAD.len());
     println!(
         "  --server-threads      {} ({} active)",
         opt.server_threads,
@@ -575,12 +524,24 @@ fn report(opt: &Opt, client_endpoint_count: usize, stats: &WorkloadStats) {
     println!();
     println!("results:");
     println!(
-        "  completed:   {} requests ({} bytes, errors: {})",
-        measured, stats.bytes, errors
+        "  client sent:        {} streams ({} bytes, errors: {})",
+        client_sends, stats.bytes, errors
     );
-    println!("  wall:        {:.3?}", stats.wall);
-    println!("  throughput:  {:.1} req/s ({:.2} MiB/s)", throughput, bytes_per_sec / (1024.0 * 1024.0));
-    println!("  latency:");
+    println!(
+        "  server received:    {} streams",
+        server_recvs
+    );
+    println!("  wall:               {:.3?}", stats.wall);
+    println!(
+        "  server throughput:  {:.1} streams/s ({:.2} MiB/s payload)",
+        server_throughput,
+        bytes_per_sec / (1024.0 * 1024.0)
+    );
+    println!(
+        "  client throughput:  {:.1} streams/s (send-side)",
+        client_throughput
+    );
+    println!("  client-side latency (open_uni + write + finish):");
     println!("    mean       {:?}", mean);
     println!("    p50        {:?}", p50);
     println!("    p90        {:?}", p90);
@@ -591,19 +552,18 @@ fn report(opt: &Opt, client_endpoint_count: usize, stats: &WorkloadStats) {
 
     if opt.csv {
         let label = opt.label.as_deref().unwrap_or("-");
-        // Column layout (kept backwards compatible with pre-sharding runs):
-        //   1 CSV,2 label,3 connections,4 workers,5 duration,6 req_bytes,
-        //   7 server_threads,8 client_threads,9 measured,10 errors,11 wall_ms,
-        //   12 throughput,13 bps,14 mean_us,15 p50_us,16 p90_us,17 p95_us,
-        //   18 p99_us,19 p999_us,20 max_us,21 server_shards,22 client_endpoints
-        // `ab_bench.sh` only reads up to column 20, so the two new fields at the
-        // tail do not perturb existing aggregations.
+        // Column layout:
+        //   1 CSV, 2 label, 3 connections, 4 workers, 5 duration, 6 payload_bytes,
+        //   7 server_threads, 8 client_threads, 9 client_sends, 10 server_recvs,
+        //   11 errors, 12 wall_ms, 13 server_throughput, 14 client_throughput,
+        //   15 bps, 16 mean_us, 17 p50_us, 18 p90_us, 19 p95_us, 20 p99_us,
+        //   21 p999_us, 22 max_us, 23 server_shards, 24 client_endpoints
         println!(
-            "CSV,{label},{connections},{workers},{duration},{req_bytes},{server_threads},{client_threads},{measured},{errors},{wall_ms:.3},{throughput:.1},{bps:.1},{mean_us},{p50_us},{p90_us},{p95_us},{p99_us},{p999_us},{max_us},{server_shards},{client_endpoints}",
+            "CSV,{label},{connections},{workers},{duration},{payload_bytes},{server_threads},{client_threads},{client_sends},{server_recvs},{errors},{wall_ms:.3},{server_throughput:.1},{client_throughput:.1},{bps:.1},{mean_us},{p50_us},{p90_us},{p95_us},{p99_us},{p999_us},{max_us},{server_shards},{client_endpoints}",
             connections = opt.connections,
             workers = opt.workers_per_conn,
             duration = opt.duration_secs,
-            req_bytes = opt.request_bytes,
+            payload_bytes = PAYLOAD.len(),
             server_threads = opt.server_threads,
             client_threads = opt.client_threads,
             wall_ms = stats.wall.as_secs_f64() * 1000.0,

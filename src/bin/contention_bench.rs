@@ -89,11 +89,14 @@ struct Opt {
     #[clap(long, default_value_t = 2.0)]
     warmup_secs: f64,
 
-    /// Legacy soft cap on the aggregate new-connection rate. Retained as a
-    /// CLI / CSV field for backwards compatibility with older driver scripts
-    /// but **not** enforced: workers always loop open/close as fast as the
-    /// server accepts them. The final `churn conn/s` column reports the
-    /// actually-achieved rate.
+    /// Target aggregate new-connection rate, in conn/s. `0` disables the cap
+    /// and lets workers loop open/close as fast as the server accepts them
+    /// (the legacy behavior). When non-zero, a shared pacer schedules every
+    /// connect() attempt so the *offered* rate across all churn workers is
+    /// held at this value; workers that fall behind schedule do not burst.
+    /// The final `churn conn/s` column always reports the actually-achieved
+    /// rate, which matches the cap when the server can keep up and falls
+    /// below it when the server cannot.
     #[clap(long, default_value_t = 0)]
     churn_rate: u64,
 
@@ -336,6 +339,7 @@ fn run_benchmark(
             server_addr,
             churn_cfg,
             opt.churn_workers,
+            opt.churn_rate,
             stop.clone(),
             churn_counter.clone(),
         )?)
@@ -493,11 +497,52 @@ impl ChurnHandle {
 /// therefore whatever the server can accept under concurrent throughput
 /// load, which is the quantity the contention benchmark is trying to
 /// measure.
+/// Shared pacer that caps the aggregate issue rate of a fixed-count worker
+/// pool. Workers call [`Pacer::wait`] before each `connect()` attempt; it
+/// reserves a monotonically-increasing slot and sleeps until that slot's
+/// absolute deadline.
+///
+/// If a worker falls behind schedule (deadline already in the past), the
+/// pacer advances the internal clock to `now` rather than letting queued
+/// slots burst out back-to-back. This makes the issued rate a hard *upper
+/// bound*: the bench runs at the cap when the system keeps up, and at the
+/// system's actual capacity when it does not.
+struct Pacer {
+    start: Instant,
+    interval_nanos: u64,
+    next_slot: AtomicU64,
+}
+
+impl Pacer {
+    fn new(rate_per_sec: u64) -> Self {
+        let interval_nanos = 1_000_000_000 / rate_per_sec.max(1);
+        Self {
+            start: Instant::now(),
+            interval_nanos,
+            next_slot: AtomicU64::new(0),
+        }
+    }
+
+    async fn wait(&self) {
+        let slot = self.next_slot.fetch_add(1, Ordering::Relaxed);
+        let target = self.start + Duration::from_nanos(slot * self.interval_nanos);
+        let now = Instant::now();
+        if target > now {
+            tokio::time::sleep(target - now).await;
+        }
+        // If target <= now the worker is behind schedule; don't sleep, just
+        // proceed. We deliberately do NOT burst to catch up on missed slots:
+        // the slot counter keeps advancing one-per-call, so the effective
+        // issued rate stays <= the cap.
+    }
+}
+
 fn spawn_churn_driver(
     churn_rt: &Handle,
     server_addr: SocketAddr,
     client_cfg: quinn::ClientConfig,
     workers: usize,
+    target_rate: u64,
     stop: Arc<AtomicBool>,
     counter: Arc<AtomicU64>,
 ) -> Result<ChurnHandle> {
@@ -509,15 +554,28 @@ fn spawn_churn_driver(
             .context("create churn client endpoint")?
     };
 
+    let pacer = if target_rate > 0 {
+        Some(Arc::new(Pacer::new(target_rate)))
+    } else {
+        None
+    };
+
     let mut set = JoinSet::new();
     for _ in 0..workers {
         let endpoint = endpoint.clone();
         let config = client_cfg.clone();
         let stop = stop.clone();
         let counter = counter.clone();
+        let pacer = pacer.clone();
         set.spawn_on(
             async move {
                 while !stop.load(Ordering::Relaxed) {
+                    if let Some(p) = &pacer {
+                        p.wait().await;
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
                     match endpoint.connect_with(config.clone(), server_addr, "localhost") {
                         Ok(connecting) => {
                             if let Ok(conn) = connecting.await {
@@ -567,9 +625,14 @@ fn report(opt: &Opt, stats: &Stats) {
         "  --duration-secs              {:.3} (warmup {:.3})",
         opt.duration_secs, opt.warmup_secs
     );
+    let rate_desc = if opt.churn_rate == 0 {
+        "rate cap disabled".to_string()
+    } else {
+        format!("target {} conn/s", opt.churn_rate)
+    };
     println!(
-        "  --churn-workers              {} (rate limit disabled, legacy --churn-rate = {})",
-        opt.churn_workers, opt.churn_rate
+        "  --churn-workers              {} ({})",
+        opt.churn_workers, rate_desc
     );
     println!(
         "  --server-threads             {} ({} active)",

@@ -89,6 +89,21 @@ CLIENT_THREADS=${CLIENT_THREADS:-$(( USABLE - SERVER_THREADS ))}
 [ "$SERVER_THREADS" -lt 1 ] && SERVER_THREADS=1
 [ "$CLIENT_THREADS" -lt 1 ] && CLIENT_THREADS=1
 
+# Number of SO_REUSEPORT sockets (= quinn::Endpoints) on the server. Default 1
+# preserves the historical single-endpoint profile. Set to e.g. $SERVER_THREADS
+# to spread UDP ingress/egress across cores via kernel 4-tuple hashing.
+SERVER_SHARDS=${SERVER_SHARDS:-1}
+# Distinct client source ports. 0 means "match SERVER_SHARDS" (the only way for
+# SO_REUSEPORT to actually split load is to spread client 4-tuples).
+CLIENT_ENDPOINTS=${CLIENT_ENDPOINTS:-0}
+# Output subdirectory tag. When sharding we default to a separate subdir so
+# shard results do not clobber the unsharded baseline.
+DEFAULT_TAG=""
+if [ "$SERVER_SHARDS" -gt 1 ]; then
+  DEFAULT_TAG="-reuseport${SERVER_SHARDS}"
+fi
+OUTDIR_TAG=${OUTDIR_TAG:-$DEFAULT_TAG}
+
 # Same as ING_ARGS in scripts/ab_bench.sh. Keep in sync.
 ING_ARGS=(
   --connections 1024
@@ -98,11 +113,14 @@ ING_ARGS=(
   --request-bytes 64
   --server-threads "$SERVER_THREADS"
   --client-threads "$CLIENT_THREADS"
+  --server-shards "$SERVER_SHARDS"
+  --client-endpoints "$CLIENT_ENDPOINTS"
   --csv
-  --label "$BRANCH"
+  --label "$BRANCH$OUTDIR_TAG"
 )
 
 echo "Host: $CORES physical cores -> server=$SERVER_THREADS client=$CLIENT_THREADS"
+echo "Sharding: server_shards=$SERVER_SHARDS client_endpoints=$CLIENT_ENDPOINTS (0 = match shards)"
 
 # -----------------------------------------------------------------------------
 # Check out branch + build with debug symbols (already enabled in Cargo.toml)
@@ -119,7 +137,7 @@ echo "=== Building ingress_bench in release mode ==="
 unset CARGO_TARGET_DIR
 cargo build --release --bin ingress_bench
 
-OUTDIR="bench-results/profile/$BRANCH"
+OUTDIR="bench-results/profile/$BRANCH$OUTDIR_TAG"
 mkdir -p "$OUTDIR"
 cp target/release/ingress_bench "$OUTDIR/ingress_bench"
 

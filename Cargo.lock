@@ -545,6 +545,7 @@ dependencies = [
  "quinn",
  "rcgen",
  "rustls",
+ "socket2",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -13,16 +13,10 @@
 set -euo pipefail
 
 BRANCHES=(
-#  main
-#  endpoint-two-phase-accept
-#  endpoint-ingress-offlock
-#  endpoint-ingress-offlock-accepting
-#  endpoint-parking-lot
   endpoint-lock-optimization-accept-split
-  endpoint-lock-optimization-accept-split-batching
-  endpoint-shrink-datagram-event
+  endpoint-lock-optimization-accept-split-response-buffer-hoist-plus-lazy-streams
 )
-OUT=bench-results
+OUT=bench-results-accept-split-vs-lazy-streams
 REPEATS=5
 
 mkdir -p "$OUT"
@@ -116,22 +110,35 @@ ING_ARGS="--connections 1024 --workers-per-conn 4 --duration-secs 20 \
 ING_BATCH_ARGS="--connections 4 --workers-per-conn 256 --duration-secs 20 \
                 --warmup-secs 3 --request-bytes 64 \
                 --server-threads $SERVER_THREADS --client-threads $CLIENT_THREADS --csv"
+# stream_open_bench: match ingress_bench's standard load profile (1024 x 4) so
+# the two slots are directly comparable. The bench measures uni-stream open
+# rate (open + 16-byte write + FIN, no response), so it isolates the NEW_STREAM
+# / MAX_STREAMS path from the full bidi echo covered by ingress_bench.
+SO_ARGS="--connections 1024 --workers-per-conn 4 --duration-secs 20 \
+         --warmup-secs 3 \
+         --server-threads $SERVER_THREADS --client-threads $CLIENT_THREADS --csv"
 HS_ARGS="--total 200000 --concurrency 2048 --warmup 5000 \
          --server-threads $SERVER_THREADS --client-threads $CLIENT_THREADS --csv"
 # Contention bench: throughput measured first in isolation, then again while a
-# dedicated churn-client runtime hammers the endpoint with short-lived
-# connections as fast as the server will accept them. `degradation%` in the
-# final table is (1 - mixed/baseline).
+# dedicated churn-client runtime opens + closes connections against the same
+# server endpoint at a *fixed offered rate*. `degradation%` in the final table
+# is (1 - mixed/baseline).
 #
 # Stream size is deliberately small (128M) and fanned out across
 # connections/streams so the throughput phase is not client-AEAD-bound —
 # otherwise the server has endless CPU headroom and server-side lock
-# contention cannot show up as a mixed-phase slowdown. Rate limiting on the
-# churn driver is disabled; `--churn-workers` is the concurrent-in-flight
-# handshake ceiling.
+# contention cannot show up as a mixed-phase slowdown.
+#
+# `--churn-rate 2000` caps the aggregate offered churn rate at 2000 conn/s
+# via a shared pacer in the binary. Holding the offered load constant across
+# branches is what makes the degradation and achieved-rate numbers directly
+# comparable: a branch that cannot keep up will report a lower achieved
+# `churn conn/s` and/or a larger `degr%`. `--churn-workers` is the concurrent
+# in-flight handshake ceiling (must be large enough not to cap below the
+# target rate; 64 workers × ~2 ms handshake ≫ 2000 conn/s).
 CONT_ARGS="--connections 8 --streams-per-connection 4 --stream-size 128M \
            --duration-secs 15 --warmup-secs 3 \
-           --churn-workers 64 \
+           --churn-workers 64 --churn-rate 2000 \
            --server-threads $SERVER_THREADS \
            --client-threads $CONT_CLIENT_THREADS \
            --churn-threads $CONT_CHURN_THREADS --csv"
@@ -139,16 +146,19 @@ CONT_ARGS="--connections 8 --streams-per-connection 4 --stream-size 128M \
 for b in "${BRANCHES[@]}"; do
   echo "=== Building $b ==="
   ( cd quinn && git checkout "$b" )
-  cargo build --release --bin ingress_bench --bin handshake_bench --bin contention_bench
-  for bench in ingress ingress_batch handshake contention; do
+  cargo build --release \
+    --bin ingress_bench --bin handshake_bench \
+    --bin stream_open_bench --bin contention_bench
+  for bench in ingress ingress_batch handshake stream_open contention; do
     for i in $(seq 1 "$REPEATS"); do
       out="$OUT/${bench}_bench-$b-run$i.txt"
       echo "--- $bench $b run $i ---"
       case "$bench" in
-        ingress)       cmd="target/release/ingress_bench    $ING_ARGS       --label $b" ;;
-        ingress_batch) cmd="target/release/ingress_bench    $ING_BATCH_ARGS --label $b" ;;
-        handshake)     cmd="target/release/handshake_bench  $HS_ARGS        --label $b" ;;
-        contention)    cmd="target/release/contention_bench $CONT_ARGS      --label $b" ;;
+        ingress)       cmd="target/release/ingress_bench     $ING_ARGS       --label $b" ;;
+        ingress_batch) cmd="target/release/ingress_bench     $ING_BATCH_ARGS --label $b" ;;
+        handshake)     cmd="target/release/handshake_bench   $HS_ARGS        --label $b" ;;
+        stream_open)   cmd="target/release/stream_open_bench $SO_ARGS        --label $b" ;;
+        contention)    cmd="target/release/contention_bench  $CONT_ARGS      --label $b" ;;
       esac
       $cmd | tee "$out"
     done
@@ -375,6 +385,43 @@ for b in "${BRANCHES[@]}"; do
       "$(_fmt_throughput "$mixed")" \
       "$(_fmt_throughput "$churn")" \
       "$(_fmt_throughput "$degr")"
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# Stream open table
+# ---------------------------------------------------------------------------
+# CSV columns for stream_open_bench (see scripts/ab_stream_open.sh for canonical
+# layout):
+#   1 CSV, 2 label, 3 connections, 4 workers, 5 duration, 6 payload_bytes,
+#   7 server_threads, 8 client_threads, 9 client_sends, 10 server_recvs,
+#  11 errors, 12 wall_ms, 13 server_throughput, 14 client_throughput,
+#  15 bps, 16 mean_us, 17 p50_us, 18 p90_us, 19 p95_us, 20 p99_us,
+#  21 p999_us, 22 max_us, 23 server_shards, 24 client_endpoints
+_stream_open_field() {
+  local branch="$1" col="$2"
+  _csv_lines "$branch" stream_open | awk -F, -v c="$col" '{print $c}' | _median
+}
+
+printf '\nStream open bench  (streams/s, latency in ms)\n'
+printf '%-28s %14s %14s %9s %9s %9s %9s %9s\n' \
+  branch "srv str/s" "cli str/s" mean p50 p99 p99.9 max
+printf -- '------------------------------------------------------------------------------------------\n'
+for b in "${BRANCHES[@]}"; do
+  srv=$(_stream_open_field "$b" 13)
+  cli=$(_stream_open_field "$b" 14)
+  if [ "$srv" = "-" ]; then
+    printf '%-28s %14s %14s %9s %9s %9s %9s %9s\n' "$b" - - - - - - -
+  else
+    printf '%-28s %14s %14s %9s %9s %9s %9s %9s\n' \
+      "$b" \
+      "$(_fmt_throughput "$srv")" \
+      "$(_fmt_throughput "$cli")" \
+      "$(_us_to_ms "$(_stream_open_field "$b" 16)")" \
+      "$(_us_to_ms "$(_stream_open_field "$b" 17)")" \
+      "$(_us_to_ms "$(_stream_open_field "$b" 20)")" \
+      "$(_us_to_ms "$(_stream_open_field "$b" 21)")" \
+      "$(_us_to_ms "$(_stream_open_field "$b" 22)")"
   fi
 done
 echo
